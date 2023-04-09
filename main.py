@@ -54,8 +54,8 @@ class RNNModel:
         train_data = data_procesada[:train_size]
         test_data = data_procesada[train_size:]
 
-        self.input_steps = 12
-        self.output_steps = 1
+        self.input_steps = 36
+        self.output_steps = 12
 
         # Crear secuencias para el conjunto de entrenamiento
         X_train, y_train = self.create_sequences(train_data)
@@ -100,33 +100,54 @@ class RNNModel:
              for t in range(self.output_steps) for _ in range(y_test.shape[2])])
         print(f"El error absoluto medio ponderado (weighted MAE) en el conjunto de prueba es: {weighted_mae}")
 
+        # Asigna el modelo entrenado al atributo self.model
+
         return model, y_pred
+
+    def predict(self, model, input_sequence):
+        # Realizar la predicción utilizando el modelo entrenado
+        y_pred = model.predict(input_sequence)
+
+        n_points = y_pred.shape[1] * y_pred.shape[2]
+        y_pred_flat = y_pred.reshape((y_pred.shape[0], n_points))
+
+        # Asegúrate de que el objeto scaler_output tenga la forma correcta
+        if self.scaler_output.n_features_in_ != n_points:
+            self.scaler_output.n_features_in_ = n_points
+            self.scaler_output.min_ = np.tile(self.scaler_output.min_, self.output_steps)
+            self.scaler_output.scale_ = np.tile(self.scaler_output.scale_, self.output_steps)
+
+        y_pred_inv = self.scaler_output.inverse_transform(y_pred_flat)
+
+        # Reorganizar las columnas de y_pred_inv de acuerdo a las características originales
+        y_pred_inv_rearranged = []
+        for i in range(0, y_pred_inv.shape[1], self.output_steps):
+            y_pred_inv_rearranged.append(y_pred_inv[:, i:i + self.output_steps])
+
+        y_pred_inv = np.hstack(y_pred_inv_rearranged)
+
+        return y_pred_inv
 
     # Guardar las predicciones en un archivo xlsx
     def save_predictions(self, y_test, y_pred, filename):
-        # Aplanar y_test y y_pred a dos dimensiones
-        y_test_flat = y_test.reshape(y_test.shape[0], -1)
-        y_pred_flat = y_pred.reshape(y_pred.shape[0], -1)
+        # Revertir la normalización para y_test
+        n_points = y_test.shape[1] * y_test.shape[2]
+        y_test_flat = y_test.reshape((y_test.shape[0], n_points))
+        y_pred_flat = y_pred.reshape((y_pred.shape[0], n_points))
 
-        # Revertir la normalización para y_test_flat
-        y_test_inv = []
-        for i in range(0, y_test_flat.shape[1], 3):
-            temp = self.scaler_output.inverse_transform(y_test_flat[:, i:i + 3])
-            y_test_inv.append(temp)
-        y_test_inv = np.hstack(y_test_inv)
+        # Asegúrate de que el objeto scaler_output tenga la forma correcta
+        if self.scaler_output.n_features_in_ != n_points:
+            self.scaler_output.n_features_in_ = n_points
+            self.scaler_output.min_ = np.tile(self.scaler_output.min_, self.output_steps)
+            self.scaler_output.scale_ = np.tile(self.scaler_output.scale_, self.output_steps)
 
-        # Revertir la normalización para y_pred_flat
-        y_pred_inv = []
-        for i in range(0, y_pred_flat.shape[1], 3):
-            temp = self.scaler_output.inverse_transform(y_pred_flat[:, i:i + 3])
-            y_pred_inv.append(temp)
-        # Aplanar y_pred_inv
-        y_pred_inv = np.hstack(y_pred_inv)
+        y_test_inv = self.scaler_output.inverse_transform(y_test_flat)
+        y_pred_inv = self.scaler_output.inverse_transform(y_pred_flat)
 
         # Crear un DataFrame de pandas con la entrada aplanada
         data = np.empty((y_test_inv.shape[0], y_test_inv.shape[1] * 2), dtype=y_test_inv.dtype)
 
-        n_variables = 3
+        n_variables = len(self.output_column_names)
         n_points = y_test_inv.shape[1] // n_variables
 
         for i in range(n_points):
@@ -134,9 +155,9 @@ class RNNModel:
                 data[:, i * n_variables * 2 + j] = y_test_inv[:, i * n_variables + j]
                 data[:, i * n_variables * 2 + j + n_variables] = y_pred_inv[:, i * n_variables + j]
 
-        columns = [f"{self.output_column_names[i]}_{t}_{i + 1}_{j + 1}" for i in range(n_points) for t in ['test', 'pred']
-                   for j in
-                   range(n_variables)]
+        columns = [f"{self.output_column_names[j]}_{t}_{i + 1}_{j + 1}" for i in range(n_points) for t in
+                   ['test', 'pred']
+                   for j in range(n_variables)]
 
         results = pd.DataFrame(data, columns=columns)
 
@@ -181,3 +202,7 @@ if __name__ == '__main__':
 
     # Graficar las predicciones y los valores reales
     rnn_model.plot_predictions(y_test, y_pred)
+
+    input_sequence = X_test[-1]
+    predictions = rnn_model.predict(model, input_sequence.reshape(1, -1, n_features))
+    print(predictions)
