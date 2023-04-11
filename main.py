@@ -1,34 +1,74 @@
-import pandas as pd
+import datetime
+
 import numpy as np
-from datetime import datetime
-from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.layers import LSTM, Dense, TimeDistributed, Reshape
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.optimizers import Adam
-import matplotlib.pyplot as plt
+import optuna
+import pandas as pd
 import tensorflow as tf
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.layers import LSTM, Dense, Reshape
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.optimizers import Adam
+from MysqlModel import MysqlModel
 
 SEMILLA = 42
 np.random.seed(SEMILLA)  # Establece la semilla aleatoria de NumPy
 tf.random.set_seed(SEMILLA)  # Establece la semilla aleatoria de TensorFlow
 
+
 class RNNModel:
     def __init__(self, input_file):
         self.input_file = input_file
+        self.data = None
         # Guardamos el escalador para poder revertir la normalización
         self.scaler_input = MinMaxScaler()
         self.scaler_output = MinMaxScaler()
-        self.input_steps = 36
-        self.output_steps = 12
+        self.input_steps = 90
+        self.output_steps = 30
+        self.best_model = None
+        self.n_features = None
+        self.X_train = None
+        self.y_train = None
+        self.X_test = None
+        self.y_test = None
+        self.output_column_names = None
+        self.fitxerModel = '.\\model\\model.h5'
+        self.hyperparameter_ranges = {
+            "n_layers": (1, 3),
+            "num_units_layer": (10, 100),
+            "lr": (1e-5, 1e-2),
+            "n_epochs": (10, 200),
+            "weights": (0.05, 1.0)
+        }
 
-    def read_data(self):
+    def read_data(self,  nomFitxer=None):
+        if nomFitxer is None:
+            nomFitxer = self.input_file
         """Lee el archivo CSV"""
-        data = pd.read_csv(self.input_file, sep=";", parse_dates=[0])
+        self.data = pd.read_csv(nomFitxer, sep=";", parse_dates=[0])
+        return self.data
+
+    # def load_data(self):
+    #     """Carga los datos"""
+    #     data = None
+    #     if self.read_data() is not None:
+    #         data = self.read_data()
+    #     return data
+
+    def load_data(self, adressFile=None):
+        """Carga los datos"""
+        data = pd.read_csv(adressFile, sep=";", parse_dates=[0])
         return data
 
-    def preprocess_data(self, data):
-        """Define la columna de fecha, categórica y numérica"""
-        data_procesada = data.copy()
+    def preprocess_data(self, data_prediccion=None):
+        """
+        Preprocesa los datos originales, normaliza los valores numéricos, codifica las variables categóricas y
+        crea secuencias de entrada y salida.
+        """
+        if data_prediccion is None:
+            data_procesada = self.data.copy()
+        else:
+            data_procesada = data_prediccion.copy()
 
         # las columnas numéricas a float
         data_procesada[data_procesada.columns[2:]] = data_procesada.iloc[:, 2:].astype(float)
@@ -48,25 +88,29 @@ class RNNModel:
         # Elimina los valores NaN
         data_procesada = data_procesada.dropna()
 
+        return data_procesada
+
+    def split_data(self):
+        data_procesada = self.preprocess_data()
+
         # Calculamos el índice donde se dividirán los datos en conjuntos de entrenamiento y prueba
-        train_size = int(len(data_procesada) * 0.8)
+        train_size = int(len(data_procesada) * 0.7)
 
         train_data = data_procesada[:train_size]
         test_data = data_procesada[train_size:]
 
-        self.input_steps = 36
-        self.output_steps = 12
-
         # Crear secuencias para el conjunto de entrenamiento
-        X_train, y_train = self.create_sequences(train_data)
-
+        self.X_train, self.y_train = self.create_sequences(train_data)
+        self.n_features = self.X_train.shape[2]
         # Crear secuencias para el conjunto de prueba
-        X_test, y_test = self.create_sequences(test_data)
+        self.X_test, self.y_test = self.create_sequences(test_data)
 
-        return X_train, y_train, X_test, y_test
+        return self.X_train, self.y_train, self.X_test, self.y_test
 
     def create_sequences(self, data):
-        """Crea secuencias de datos de entrada y salida"""
+        """
+               Crea secuencias de datos de entrada y salida a partir del conjunto de datos procesado.
+        """
         X, y = [], []
 
         # Recorrer el conjunto de datos y crear secuencias de entrada y salida
@@ -82,17 +126,21 @@ class RNNModel:
 
         return np.array(X), np.array(y)
 
-    def create_model(self, n_layers, num_units_layer, lr, n_features, X_train, y_train, X_test, y_test):
-        # Definir y entrenar el modelo LSTM
+    def create_model(self, n_layers, num_units_layer, lr, X_train, y_train, n_epochs, X_test, y_test):
+        """
+               Crea y entrena un modelo LSTM con los hiperparámetros proporcionados.
+        """
+        n_features = X_train.shape[2]
         model = Sequential()
+        model.add(LSTM(num_units_layer, input_shape=(self.input_steps, n_features), return_sequences=True))
 
         for i in range(n_layers - 1):
-            model.add(LSTM(num_units_layer, input_shape=(self.input_steps, n_features), return_sequences=True))
+            model.add(LSTM(num_units_layer, return_sequences=True))
         model.add(LSTM(num_units_layer, return_sequences=False))
         model.add(Dense(self.output_steps * y_train.shape[2], activation=None))
         model.add(Reshape((self.output_steps, y_train.shape[2])))
         model.compile(optimizer=Adam(learning_rate=lr), loss='mae')
-        model.fit(X_train, y_train, epochs=50, validation_data=(X_test, y_test))
+        model.fit(X_train, y_train, epochs=n_epochs,verbose=0, validation_data=(X_test, y_test))
         y_pred = model.predict(X_test)
         weights = np.full(y_test.shape[2], 1 / y_test.shape[2])
         weighted_mae = np.mean(
@@ -100,9 +148,34 @@ class RNNModel:
              for t in range(self.output_steps) for _ in range(y_test.shape[2])])
         print(f"El error absoluto medio ponderado (weighted MAE) en el conjunto de prueba es: {weighted_mae}")
 
-        # Asigna el modelo entrenado al atributo self.model
+        # Asigna el modelo entrenado al atributo self.best_model
+        return model, weighted_mae
 
-        return model, y_pred
+    def objective(self, trial):
+        """
+                Define el objetivo que Optuna debe minimizar. Este método entrena un modelo con hiperparámetros sugeridos
+                por Optuna y devuelve el error absoluto medio ponderado.
+        """
+        n_layers = trial.suggest_int("n_layers", self.hyperparameter_ranges["n_layers"][0],
+                                     self.hyperparameter_ranges["n_layers"][1])
+        num_units_layer = trial.suggest_int("num_units_layer", self.hyperparameter_ranges["num_units_layer"][0],
+                                            self.hyperparameter_ranges["num_units_layer"][1])
+        lr = trial.suggest_float("lr", self.hyperparameter_ranges["lr"][0], self.hyperparameter_ranges["lr"][1],
+                                 log=True)
+        weights = trial.suggest_float("weights", self.hyperparameter_ranges["weights"][0],
+                                      self.hyperparameter_ranges["weights"][1])
+        n_epochs = trial.suggest_int("n_epochs", self.hyperparameter_ranges["n_epochs"][0],
+                                     self.hyperparameter_ranges["n_epochs"][1])
+
+        # Entrenar el modelo
+        model, weighted_mae = self.create_model(n_layers, num_units_layer, lr, self.X_train, self.y_train, n_epochs,
+                                                self.X_test, self.y_test)
+
+        # Si es el primer trial o si el modelo es mejor que el mejor encontrado hasta ahora, guarda el modelo
+        if trial.number == 0 or weighted_mae < trial.study.best_value:
+            self.best_model = model
+
+        return weighted_mae
 
     def predict(self, model, input_sequence):
         # Realizar la predicción utilizando el modelo entrenado
@@ -128,81 +201,65 @@ class RNNModel:
 
         return y_pred_inv
 
-    # Guardar las predicciones en un archivo xlsx
-    def save_predictions(self, y_test, y_pred, filename):
-        # Revertir la normalización para y_test
-        n_points = y_test.shape[1] * y_test.shape[2]
-        y_test_flat = y_test.reshape((y_test.shape[0], n_points))
-        y_pred_flat = y_pred.reshape((y_pred.shape[0], n_points))
+    def predict_last_rows(self):
+        """Ejecutar la predicción del mejor modelo con un fichero y seleccionar las últimas filas."""
 
-        # Asegúrate de que el objeto scaler_output tenga la forma correcta
-        if self.scaler_output.n_features_in_ != n_points:
-            self.scaler_output.n_features_in_ = n_points
-            self.scaler_output.min_ = np.tile(self.scaler_output.min_, self.output_steps)
-            self.scaler_output.scale_ = np.tile(self.scaler_output.scale_, self.output_steps)
+        # Cargar los datos del fichero
+        data_copiada = self.data.copy()
+        calcular_tamany = self.input_steps + self.output_steps
+        data_limitat = data_copiada.tail(calcular_tamany)
 
-        y_test_inv = self.scaler_output.inverse_transform(y_test_flat)
-        y_pred_inv = self.scaler_output.inverse_transform(y_pred_flat)
+        data_procesada = self.preprocess_data(data_prediccion=data_limitat)
 
-        # Crear un DataFrame de pandas con la entrada aplanada
-        data = np.empty((y_test_inv.shape[0], y_test_inv.shape[1] * 2), dtype=y_test_inv.dtype)
+        x_prediccio, y_prediccio = self.create_sequences(data_procesada)
 
-        n_variables = len(self.output_column_names)
-        n_points = y_test_inv.shape[1] // n_variables
+        n_features = x_prediccio.shape[2]
 
-        for i in range(n_points):
-            for j in range(n_variables):
-                data[:, i * n_variables * 2 + j] = y_test_inv[:, i * n_variables + j]
-                data[:, i * n_variables * 2 + j + n_variables] = y_pred_inv[:, i * n_variables + j]
+        y_pred = self.predict(self.best_model, x_prediccio)
 
-        columns = [f"{self.output_column_names[j]}_{t}_{i + 1}_{j + 1}" for i in range(n_points) for t in
-                   ['test', 'pred']
-                   for j in range(n_variables)]
 
-        results = pd.DataFrame(data, columns=columns)
+        # Organizar y guardar la predicción en un archivo
+        column_names = ['Index'] + [f'Column_{i}' for i in range(1, 4)]
+        repeated_numbers = np.tile(np.arange(1, 6), len(y_pred[0]) // (3 * 5) + 1)[:len(y_pred[0]) // 3]
+        y_pred_reshaped = np.column_stack((repeated_numbers, y_pred[0][::3], y_pred[0][1::3], y_pred[0][2::3]))
+        output_df = pd.DataFrame(y_pred_reshaped, columns=column_names)
 
-        # Guardar el DataFrame en un archivo Excel
-        results.to_excel(filename, index=False)
-
-    # Graficar las predicciones y los valores reales de cada variable
-    def plot_predictions(self, y_test, y_pred):
-        """Grafica las predicciones y los valores reales de cada variable"""
-
-        variables = ['Variable_1', 'Variable_2', 'Variable_3']
-
-        for i in range(y_test.shape[2]):
-            plt.figure(figsize=(12, 6))
-            plt.plot(y_test[:, :, i], label=f"{variables[i]} real")
-            plt.plot(y_pred[:, :, i], label=f"{variables[i]} predicho", linestyle="--")
-            plt.legend()
-            plt.xlabel("Temps")
-            plt.ylabel("Valor")
-            plt.title(f"Comparació de dades reals i prediccions per a {self.output_column_names[i]}")
-            current_time = datetime.now().strftime("%d-%m-%Y_%H-%M")
-            plt.savefig(f".\\GRAFIC\\grafic_{self.output_column_names[i]}_{current_time}.png")
+        current_time = datetime.datetime.now().strftime("%d-%m-%Y_%H-%M")
+        output_file = f".\\predicciones\\primer_semestre{current_time}.xlsx"
+        output_df.to_excel(output_file, index=False)
+        print(f"Predicción guardada en el archivo: {output_file}")
 
 
 if __name__ == '__main__':
+    optuna = True
+    prediccio = True
+    guardar_model = True
+
     rnn_model = RNNModel(input_file=".\\dades\\Dades_Per_entrenar.csv")
-    data = rnn_model.read_data()
-    X_train, y_train, X_test, y_test = rnn_model.preprocess_data(data)
+    if optuna:
+        # Leer los datos
+        X_train, y_train, X_test, y_test = rnn_model.preprocess_data()
 
-    # Establecer los hiperparámetros del modelo
-    n_layers = 2
-    num_units_layer = 64
-    lr = 0.001
-    n_features = X_train.shape[2]
+        # Ejecutar la optimización de Optuna
+        study = optuna.create_study(direction="minimize")
+        study.optimize(rnn_model.objective, n_trials=4000)
 
-    model, y_pred = rnn_model.create_model(n_layers, num_units_layer, lr, n_features, X_train, y_train,
-                           X_test, y_test)
+        # Obtener y mostrar los mejores hiperparámetros encontrados por Optuna
+        best_params = study.best_params
+        # Crear una instancia de la clase MysqlModel
+        if guardar_model:
+            MysqlModel.guardar(rnn_model.best_model)
 
-    # Guardar las predicciones en un archivo CSV
-    current_time = datetime.now().strftime("%d-%m-%Y_%H-%M")
-    rnn_model.save_predictions(y_test, y_pred, (f".\\previsio\\prediccions_RNNModel_2023_{current_time}.xlsx"))
+    if prediccio:
+        # Leer los datos
+        data = rnn_model.read_data(nomFitxer=".\\dades\\Dades_Per_entrenar.csv")
+        # Crear una instancia de la clase MysqlModel
+        mysql_model = MysqlModel()
+        # Obtener los datos del fichero de predicción
+        fitxerModel = mysql_model.recuperar()
+        rnn_model.best_model = load_model(fitxerModel)
+        # Ejecutar la predicción
+        rnn_model.predict_last_rows()
 
-    # Graficar las predicciones y los valores reales
-    rnn_model.plot_predictions(y_test, y_pred)
 
-    input_sequence = X_test[-1]
-    predictions = rnn_model.predict(model, input_sequence.reshape(1, -1, n_features))
-    print(predictions)
+
