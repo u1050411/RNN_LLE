@@ -9,6 +9,8 @@ from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.layers import LSTM, Dense, Reshape
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+from optuna.integration import TFKerasPruningCallback
 from MysqlModel import MysqlModel
 
 SEMILLA = 42
@@ -35,15 +37,15 @@ class RNNModel:
         self.fitxerModel = '.\\model\\model.h5'
         self.hyperparameter_ranges = {
             "n_layers": (1, 3),
-            "num_units_layer": (10, 100),
+            "num_units_layer": (10, 300),
             "lr": (1e-5, 1e-2),
             "n_epochs": (10, 200),
-            "weights": (0.05, 1.0)
+            "weights": (0.1, 1.0)
         }
 
     def read_data(self,  nomFitxer=None):
         if nomFitxer is None:
-            nomFitxer = self.input_file
+           nomFitxer = self.input_file
         """Lee el archivo CSV"""
         self.data = pd.read_csv(nomFitxer, sep=";", parse_dates=[0])
         return self.data
@@ -90,8 +92,8 @@ class RNNModel:
 
         return data_procesada
 
-    def split_data(self):
-        data_procesada = self.preprocess_data()
+    def split_data(self, data_procesada):
+        """ Divide los datos en conjuntos de entrenamiento y prueba """
 
         # Calculamos el índice donde se dividirán los datos en conjuntos de entrenamiento y prueba
         train_size = int(len(data_procesada) * 0.7)
@@ -126,9 +128,10 @@ class RNNModel:
 
         return np.array(X), np.array(y)
 
-    def create_model(self, n_layers, num_units_layer, lr, X_train, y_train, n_epochs, X_test, y_test):
+    def create_model(self, trial, n_layers, num_units_layer, lr, X_train, y_train, n_epochs, X_test, y_test,
+                     batch_size):
         """
-               Crea y entrena un modelo LSTM con los hiperparámetros proporcionados.
+        Crea un modelo LSTM con los hiperparámetros proporcionados.
         """
         n_features = X_train.shape[2]
         model = Sequential()
@@ -139,37 +142,36 @@ class RNNModel:
         model.add(LSTM(num_units_layer, return_sequences=False))
         model.add(Dense(self.output_steps * y_train.shape[2], activation=None))
         model.add(Reshape((self.output_steps, y_train.shape[2])))
+
         model.compile(optimizer=Adam(learning_rate=lr), loss='mae')
-        model.fit(X_train, y_train, epochs=n_epochs,verbose=0, validation_data=(X_test, y_test))
+
+        # Devuelve solo el modelo
+        return model
+
+    def objective(self, trial):
+        """
+        Define el objetivo que Optuna debe minimizar. Este método entrena un modelo con hiperparámetros sugeridos
+        por Optuna y devuelve el error absoluto medio ponderado.
+        """
+        n_layers = trial.suggest_int('n_layers', 1, 3)
+        num_units_layer = trial.suggest_int('num_units_layer', 30, 100)
+        lr = trial.suggest_float('lr', 1e-5, 1e-3, log=True)
+        n_epochs = trial.suggest_int('n_epochs', 10, 100)
+        batch_size = trial.suggest_int('batch_size', 16, 128)
+
+        model = self.create_model(trial, n_layers, num_units_layer, lr, X_train, y_train, n_epochs, X_test, y_test,
+                                  batch_size)
+
+        early_stop = EarlyStopping(monitor='val_loss', patience=5)
+        pruning_callback = TFKerasPruningCallback(trial, 'val_loss')
+        model.fit(X_train, y_train, epochs=n_epochs, batch_size=batch_size, validation_data=(X_test, y_test),
+                  callbacks=[early_stop, pruning_callback])
+
         y_pred = model.predict(X_test)
         weights = np.full(y_test.shape[2], 1 / y_test.shape[2])
         weighted_mae = np.mean(
             [np.sum(weights * np.abs(y_test[:, t] - y_pred[:, t])) / np.sum(weights)
              for t in range(self.output_steps) for _ in range(y_test.shape[2])])
-        print(f"El error absoluto medio ponderado (weighted MAE) en el conjunto de prueba es: {weighted_mae}")
-
-        # Asigna el modelo entrenado al atributo self.best_model
-        return model, weighted_mae
-
-    def objective(self, trial):
-        """
-                Define el objetivo que Optuna debe minimizar. Este método entrena un modelo con hiperparámetros sugeridos
-                por Optuna y devuelve el error absoluto medio ponderado.
-        """
-        n_layers = trial.suggest_int("n_layers", self.hyperparameter_ranges["n_layers"][0],
-                                     self.hyperparameter_ranges["n_layers"][1])
-        num_units_layer = trial.suggest_int("num_units_layer", self.hyperparameter_ranges["num_units_layer"][0],
-                                            self.hyperparameter_ranges["num_units_layer"][1])
-        lr = trial.suggest_float("lr", self.hyperparameter_ranges["lr"][0], self.hyperparameter_ranges["lr"][1],
-                                 log=True)
-        weights = trial.suggest_float("weights", self.hyperparameter_ranges["weights"][0],
-                                      self.hyperparameter_ranges["weights"][1])
-        n_epochs = trial.suggest_int("n_epochs", self.hyperparameter_ranges["n_epochs"][0],
-                                     self.hyperparameter_ranges["n_epochs"][1])
-
-        # Entrenar el modelo
-        model, weighted_mae = self.create_model(n_layers, num_units_layer, lr, self.X_train, self.y_train, n_epochs,
-                                                self.X_test, self.y_test)
 
         # Si es el primer trial o si el modelo es mejor que el mejor encontrado hasta ahora, guarda el modelo
         if trial.number == 0 or weighted_mae < trial.study.best_value:
@@ -231,24 +233,27 @@ class RNNModel:
 
 
 if __name__ == '__main__':
-    optuna = True
+    usar_optuna = True
     prediccio = True
     guardar_model = True
 
     rnn_model = RNNModel(input_file=".\\dades\\Dades_Per_entrenar.csv")
-    if optuna:
+    rnn_model.read_data()
+    if usar_optuna:
         # Leer los datos
-        X_train, y_train, X_test, y_test = rnn_model.preprocess_data()
+        data_preprocessada = rnn_model.preprocess_data()
+        X_train, y_train, X_test, y_test = rnn_model.split_data(data_preprocessada)
 
         # Ejecutar la optimización de Optuna
         study = optuna.create_study(direction="minimize")
-        study.optimize(rnn_model.objective, n_trials=4000)
+        study.optimize(rnn_model.objective, n_trials=4)
 
         # Obtener y mostrar los mejores hiperparámetros encontrados por Optuna
         best_params = study.best_params
         # Crear una instancia de la clase MysqlModel
         if guardar_model:
-            MysqlModel.guardar(rnn_model.best_model)
+            mySql = MysqlModel()
+            mySql.guardar(rnn_model.best_model)
 
     if prediccio:
         # Leer los datos
