@@ -30,8 +30,10 @@ class RNNModel:
         # Guardamos el escalador para poder revertir la normalización
         self.scaler_input = MinMaxScaler()
         self.scaler_output = MinMaxScaler()
-        self.input_steps = 90
-        self.output_steps = 30
+        self.input_steps = 18
+        self.output_steps = 6
+        self.input_steps_categoria = 90
+        self.output_steps_categoria = 30
         self.best_model = None
         self.best_trial_value = None
         self.n_features = None
@@ -43,9 +45,9 @@ class RNNModel:
         self.fitxerModel = '.\\model\\model.h5'
         self.hyperparameter_ranges = {
             "n_layers": [1, 3],
-            "num_units_layer": [16, 64],
+            "num_units_layer": [16, 200],
             "lr": [1e-4, 1e-2],
-            "n_epochs": [10, 100],
+            "n_epochs": [50, 100],
             "batch_size": [16, 64]
         }
 
@@ -62,6 +64,20 @@ class RNNModel:
         return data
 
     def preprocess_data(self, data_prediccion=None):
+        if data_prediccion is None:
+            data_procesada = self.data.copy()
+        else:
+            data_procesada = data_prediccion.copy()
+
+        data_procesada[data_procesada.columns[1:]] = data_procesada.iloc[:, 1:].astype(float)
+        data_procesada.iloc[:, 4:] = self.scaler_input.fit_transform(data_procesada.iloc[:, 4:])
+        data_procesada.iloc[:, 1:4] = self.scaler_output.fit_transform(data_procesada.iloc[:, 1:4])
+        data_procesada = data_procesada.drop(data_procesada.columns[0], axis=1)
+        data_procesada = data_procesada.dropna()
+
+        return data_procesada
+
+    def preprocess_data_categoria(self, data_prediccion=None):
         if data_prediccion is None:
             data_procesada = self.data.copy()
         else:
@@ -102,7 +118,7 @@ class RNNModel:
             raise ValueError(f"Se requieren al menos {self.input_steps} registros en los datos para la predicción.")
 
         # Tomar solo los últimos 'input_steps' datos
-        input_data = data.iloc[-self.input_steps:, [0, *range(3, data.shape[1])]].values
+        input_data = data.iloc[-self.input_steps:, [0, *range(4, data.shape[1])]].values
 
         return np.array([input_data])
 
@@ -115,7 +131,26 @@ class RNNModel:
         # Recorrer el conjunto de datos y crear secuencias de entrada y salida
         for i in range(len(data) - self.input_steps - self.output_steps + 1):
             # Seleccionar las columnas de entrada (todas menos las tres numéricas que se quieren predecir)
-            input_data = data.iloc[i:i + self.input_steps, [0, *range(3, data.shape[1])]].values
+            input_data = data.iloc[i:i + self.input_steps, [0, *range(4, data.shape[1])]].values
+            # Seleccionar las columnas de salida (numéricas)
+            output_data = data.iloc[i + self.input_steps:i + self.input_steps + self.output_steps, 0:3].values
+            self.output_column_names = data.columns[3:6].tolist()
+
+            X.append(input_data)
+            y.append(output_data)
+
+        return np.array(X), np.array(y)
+
+    def create_sequences_categoria(self, data):
+        """
+               Crea secuencias de datos de entrada y salida a partir del conjunto de datos procesado.
+        """
+        X, y = [], []
+
+        # Recorrer el conjunto de datos y crear secuencias de entrada y salida
+        for i in range(len(data) - self.input_steps - self.output_steps + 1):
+            # Seleccionar las columnas de entrada (todas menos las tres numéricas que se quieren predecir)
+            input_data = data.iloc[i:i + self.input_steps, [0, *range(4, data.shape[1])]].values
             # Seleccionar las columnas de salida (numéricas)
             output_data = data.iloc[i + self.input_steps:i + self.input_steps + self.output_steps, 0:3].values
             self.output_column_names = data.columns[3:6].tolist()
@@ -241,12 +276,13 @@ class RNNModel:
 
         # Cargar los datos del fichero
         data_copiada = self.data.copy()
-        calcular_tamany = self.input_steps + self.output_steps
-        data_limitat = data_copiada.tail(calcular_tamany)
+        data_copiada = data_copiada.dropna()
+
+        data_limitat = data_copiada.tail(self.input_steps)
 
         data_procesada = self.preprocess_data(data_prediccion=data_limitat)
 
-        x_prediccio, y_prediccio = self.create_sequences(data_procesada)
+        x_prediccio = self.create_sequences_for_prediction(data_procesada)
 
         n_features = x_prediccio.shape[2]
 
@@ -269,7 +305,7 @@ if __name__ == '__main__':
     usar_optuna = True
     prediccio = True
     guardar_model = True
-    input_file = ".\\dades\\Dades_Per_entrenar.csv"  # Reemplazar por la ruta del archivo CSV
+    input_file = ".\\dades\\Dades_Per_entrenarN.csv"  # Reemplazar por la ruta del archivo CSV
     rnn = RNNModel(input_file)
     data = rnn.read_data()
     if usar_optuna:
@@ -277,7 +313,7 @@ if __name__ == '__main__':
         rnn.split_data(data_procesada)
 
         print("Optimizando hiperparámetros...")
-        best_params = rnn.optimize(n_trials=30)
+        best_params = rnn.optimize(n_trials=500)
         print(f"Mejores hiperparámetros encontrados: {best_params}")
         print(best_params)
 
@@ -290,7 +326,7 @@ if __name__ == '__main__':
             mySql = MysqlModel()
             mySql.guardar(final_model)
             # Leer los datos
-            data = rnn.read_data(nomFitxer=".\\dades\\Dades_Per_entrenar.csv")
+            data = rnn.read_data(nomFitxer=".\\dades\\Dades_Per_entrenarN.csv")
             # Crear una instancia de la clase MysqlModel
             mysql_model = MysqlModel()
             # Obtener los datos del fichero de predicción
