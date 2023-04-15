@@ -42,12 +42,11 @@ class RNNModel:
         self.output_column_names = None
         self.fitxerModel = '.\\model\\model.h5'
         self.hyperparameter_ranges = {
-            "n_layers": (1, 3),
-            "num_units_layer": (10, 100),
-            "lr": (1e-5, 1e-2),
-            "n_epochs": (10, 10),# Vamos a fijar los n_epochs a 50
-            "weights": (0.1, 1.0),
-            "batch_size": (16, 128)
+            "n_layers": [1, 3],
+            "num_units_layer": [16, 64],
+            "lr": [1e-4, 1e-2],
+            "n_epochs": [10, 100],
+            "batch_size": [16, 64]
         }
 
     def read_data(self, nomFitxer=None):
@@ -70,16 +69,7 @@ class RNNModel:
 
         data_procesada[data_procesada.columns[2:]] = data_procesada.iloc[:, 2:].astype(float)
         data_procesada = pd.get_dummies(data_procesada, columns=['Gran Grup'], prefix='Gran Grup')
-
-        # Crear una lista de escaladores MinMax para cada categoría
-        self.scalers_input = [MinMaxScaler() for _ in range(5)]
-
-        for i in range(5):
-            # Aplicar el escalador correspondiente a las filas de cada categoría
-            category_mask = (data_procesada[f'Gran Grup_{i + 1}'] == 1)
-            data_procesada.loc[category_mask, data_procesada.columns[4:-5]] = self.scalers_input[i].fit_transform(
-                data_procesada.loc[category_mask, data_procesada.columns[4:-5]])
-
+        data_procesada.iloc[:, 4:-5] = self.scaler_input.fit_transform(data_procesada.iloc[:, 4:-5])
         data_procesada.iloc[:, 1:4] = self.scaler_output.fit_transform(data_procesada.iloc[:, 1:4])
         data_procesada = data_procesada.drop(data_procesada.columns[0], axis=1)
         data_procesada = data_procesada.dropna()
@@ -223,26 +213,19 @@ class RNNModel:
         return study.best_params
 
     def predict(self, model, input_sequence):
-        if model:
-            y_pred = model.predict(input_sequence)
-        else:
-            y_pred = self.best_model.predict(input_sequence)
+        # Realizar la predicción utilizando el modelo entrenado
+        y_pred = model.predict(input_sequence)
 
-        y_pred_inv = np.zeros(y_pred.shape)
+        n_points = y_pred.shape[1] * y_pred.shape[2]
+        y_pred_flat = y_pred.reshape((y_pred.shape[0], n_points))
 
-        for i in range(5):
-            # Aplicar el escalador inverso correspondiente a las filas de cada categoría
-            category_mask = (input_sequence[:, :, -5:] == [1 if j == i else 0 for j in range(5)]).all(axis=2)
-            category_indices = np.where(category_mask)[0]
+        # Asegúrate de que el objeto scaler_output tenga la forma correcta
+        if self.scaler_output.n_features_in_ != n_points:
+            self.scaler_output.n_features_in_ = n_points
+            self.scaler_output.min_ = np.tile(self.scaler_output.min_, self.output_steps)
+            self.scaler_output.scale_ = np.tile(self.scaler_output.scale_, self.output_steps)
 
-            # Extraer las filas relevantes de y_pred y seleccionar solo las tres primeras columnas
-            y_pred_subset = y_pred[0, category_indices, :3]
-
-            # Aplicar el escalador inverso correspondiente a las filas de cada categoría
-            y_pred_subset_inv = self.scalers_input[i].inverse_transform(y_pred_subset)
-
-            # Asignar los valores transformados a las filas correspondientes en y_pred_inv
-            y_pred_inv[0, category_indices, :3] = y_pred_subset_inv
+        y_pred_inv = self.scaler_output.inverse_transform(y_pred_flat)
 
         # Reorganizar las columnas de y_pred_inv de acuerdo a las características originales
         y_pred_inv_rearranged = []
@@ -258,12 +241,12 @@ class RNNModel:
 
         # Cargar los datos del fichero
         data_copiada = self.data.copy()
-        calcular_tamany = self.input_steps
+        calcular_tamany = self.input_steps + self.output_steps
         data_limitat = data_copiada.tail(calcular_tamany)
 
         data_procesada = self.preprocess_data(data_prediccion=data_limitat)
 
-        x_prediccio = self.create_sequences_for_prediction(data_procesada)
+        x_prediccio, y_prediccio = self.create_sequences(data_procesada)
 
         n_features = x_prediccio.shape[2]
 
@@ -294,7 +277,7 @@ if __name__ == '__main__':
         rnn.split_data(data_procesada)
 
         print("Optimizando hiperparámetros...")
-        best_params = rnn.optimize(n_trials=2)
+        best_params = rnn.optimize(n_trials=30)
         print(f"Mejores hiperparámetros encontrados: {best_params}")
         print(best_params)
 
@@ -318,6 +301,6 @@ if __name__ == '__main__':
 
     if prediccio:
 
-        rnn.best_model = load_model(fitxerModel)
+        rnn.best_model = load_model(rnn.fitxerModel)
         # Ejecutar la predicción
         rnn.predict_last_rows()
