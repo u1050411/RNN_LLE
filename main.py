@@ -3,6 +3,7 @@ import datetime
 import numpy as np
 import optuna
 import pandas as pd
+import tensorflow as tf
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.layers import LSTM, Dense, Reshape
 from tensorflow.keras.models import Sequential, load_model
@@ -11,19 +12,7 @@ from MysqlModel import MysqlModel
 import tensorflow.keras.backend as K
 from optuna.pruners import MedianPruner
 from tensorflow.keras.layers import Bidirectional
-from tensorflow.keras.callbacks import EarlyStopping
-from optuna.integration import TFKerasPruningCallback
-from tensorflow.keras.layers import Activation
-from tensorflow.keras.activations import relu
-
-import tensorflow as tf
-
-def clipped_relu(x):
-    return tf.keras.activations.relu(x, max_value=0)
-
-
-
-
+from keras.callbacks import EarlyStopping
 
 
 from sklearn.metrics import accuracy_score, mean_squared_error, mean_absolute_error, r2_score
@@ -52,13 +41,12 @@ class RNNModel:
         self.y_test = None
         self.output_column_names = None
         self.fitxerModel = '.\\model\\model.h5'
-        tf.keras.utils.get_custom_objects().update({'clipped_relu': clipped_relu})
         self.hyperparameter_ranges = {
-            "n_layers": (1, 5),
-            "num_units_layer": (10, 200),
+            "n_layers": (1, 3),
+            "num_units_layer": (10, 100),
             "lr": (1e-5, 1e-2),
-            "n_epochs": (10, 200),
-            "layer_weights": (0.1, 1.0),
+            "n_epochs": (10, 10),# Vamos a fijar los n_epochs a 50
+            "weights": (0.1, 1.0),
             "batch_size": (16, 128)
         }
 
@@ -115,6 +103,19 @@ class RNNModel:
 
         return self.x_train, self.y_train, self.x_test, self.y_test
 
+    def create_sequences_for_prediction(self, data):
+        """
+        Crea secuencias de datos de entrada a partir del conjunto de datos procesado para realizar predicciones.
+        """
+        # Asegurarse de que los datos contienen al menos los últimos 'input_steps'
+        if len(data) < self.input_steps:
+            raise ValueError(f"Se requieren al menos {self.input_steps} registros en los datos para la predicción.")
+
+        # Tomar solo los últimos 'input_steps' datos
+        input_data = data.iloc[-self.input_steps:, [0, *range(3, data.shape[1])]].values
+
+        return np.array([input_data])
+
     def create_sequences(self, data):
         """
                Crea secuencias de datos de entrada y salida a partir del conjunto de datos procesado.
@@ -134,7 +135,7 @@ class RNNModel:
 
         return np.array(X), np.array(y)
 
-    def create_model(self, n_layers, num_units_layer, lr, layer_weights):
+    def create_model(self, n_layers, num_units_layer, lr):
         """
         Crea un modelo LSTM con los hiperparámetros proporcionados.
         """
@@ -145,9 +146,6 @@ class RNNModel:
 
         for i in range(n_layers - 1):
             model.add(Bidirectional(LSTM(num_units_layer, return_sequences=True)))
-            model.layers[-1].set_weights(
-                [w * layer_weights for w in model.layers[-1].get_weights()])  # Añadir esta línea
-
         model.add(Bidirectional(LSTM(num_units_layer, return_sequences=False)))
         model.add(Dense(self.output_steps * self.y_train.shape[2], activation=None))
         model.add(Reshape((self.output_steps, self.y_train.shape[2])))
@@ -174,16 +172,11 @@ class RNNModel:
         batch_size = trial.suggest_int("batch_size", self.hyperparameter_ranges["batch_size"][0],
                                        self.hyperparameter_ranges["batch_size"][1])
 
-        layer_weights = trial.suggest_float("layer_weights", self.hyperparameter_ranges["layer_weights"][0],
-                                            self.hyperparameter_ranges["layer_weights"][1])
+        model = self.create_model(n_layers, num_units_layer, lr)
 
-        model = self.create_model(n_layers, num_units_layer, lr, layer_weights)
-
-        early_stop = EarlyStopping(monitor='val_loss', patience=3)
-        pruning_callback = TFKerasPruningCallback(trial, 'val_loss')
-
-        history = model.fit(self.x_train, self.y_train, epochs=n_epochs, batch_size=batch_size, verbose=0,
-                            validation_data=(self.x_test, self.y_test), callbacks=[early_stop, pruning_callback])
+        early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+        history = model.fit(self.x_train, self.y_train, epochs=n_epochs, batch_size=batch_size, verbose=1,
+                            validation_data=(self.x_test, self.y_test), callbacks=[early_stopping])
 
         # Evaluar el modelo en el conjunto de prueba
         y_pred = model.predict(self.x_test)
@@ -197,15 +190,25 @@ class RNNModel:
 
         return weighted_mae
 
+    def get_error_weights(self, output_steps):
+        weights = [1 / (i + 1) for i in range(output_steps)]
+        return tf.constant(weights, dtype=tf.float64)
+
+    @tf.function
     def weighted_mean_absolute_error(self, y_true, y_pred):
         """
         Calcula el error absoluto medio ponderado, dando más peso a los errores
         en las primeras etapas de la secuencia de salida.
         """
-        absolute_errors = np.abs(y_true - y_pred)
-        weights = np.array([1 / (i + 1) for i in range(self.output_steps)]).reshape(-1, 1)
+        y_pred = tf.cast(y_pred, tf.float64)  # Convertir y_pred a float64
+        y_true = tf.cast(y_true, tf.float64)  # Convertir y_true a float64
+        absolute_errors = tf.math.abs(y_true - y_pred)
+
+        weights = self.get_error_weights(self.output_steps)
+        weights = tf.reshape(weights, (-1, 1))  # Asegurar que weights tenga la forma (-1, 1)
         weighted_absolute_errors = absolute_errors * weights
-        return np.mean(weighted_absolute_errors)
+
+        return tf.reduce_mean(weighted_absolute_errors)
 
     def optimize(self, n_trials=50):
         """
@@ -220,26 +223,26 @@ class RNNModel:
         return study.best_params
 
     def predict(self, model, input_sequence):
-        # Realizar la predicción utilizando el mejor modelo encontrado
+        if model:
+            y_pred = model.predict(input_sequence)
+        else:
+            y_pred = self.best_model.predict(input_sequence)
 
-        if model is None:
-            model = self.best_model
-
-        data_procesada = self.preprocess_data(input_sequence)
-
-        x, y = self.create_sequences(data_procesada)
-
-        y_pred = model.predict(x)
-
-        n_points = y_pred.shape[1] * y_pred.shape[2]
-        y_pred_flat = y_pred.reshape((y_pred.shape[0], n_points))
-
-        y_pred_inv = np.zeros(y_pred_flat.shape)
+        y_pred_inv = np.zeros(y_pred.shape)
 
         for i in range(5):
             # Aplicar el escalador inverso correspondiente a las filas de cada categoría
-            category_mask = (input_sequence[:, -1, -5:] == [1 if j == i else 0 for j in range(5)]).all(axis=1)
-            y_pred_inv[category_mask] = self.scalers_input[i].inverse_transform(y_pred_flat[category_mask])
+            category_mask = (input_sequence[:, :, -5:] == [1 if j == i else 0 for j in range(5)]).all(axis=2)
+            category_indices = np.where(category_mask)[0]
+
+            # Extraer las filas relevantes de y_pred y seleccionar solo las tres primeras columnas
+            y_pred_subset = y_pred[0, category_indices, :3]
+
+            # Aplicar el escalador inverso correspondiente a las filas de cada categoría
+            y_pred_subset_inv = self.scalers_input[i].inverse_transform(y_pred_subset)
+
+            # Asignar los valores transformados a las filas correspondientes en y_pred_inv
+            y_pred_inv[0, category_indices, :3] = y_pred_subset_inv
 
         # Reorganizar las columnas de y_pred_inv de acuerdo a las características originales
         y_pred_inv_rearranged = []
@@ -250,20 +253,21 @@ class RNNModel:
 
         return y_pred_inv
 
-
-
-
-
     def predict_last_rows(self):
         """Ejecutar la predicción del mejor modelo con un fichero y seleccionar las últimas filas."""
 
         # Cargar los datos del fichero
         data_copiada = self.data.copy()
-        calcular_tamany = self.input_steps + self.output_steps
+        calcular_tamany = self.input_steps
         data_limitat = data_copiada.tail(calcular_tamany)
 
+        data_procesada = self.preprocess_data(data_prediccion=data_limitat)
 
-        y_pred = self.predict(self.best_model, data_limitat)
+        x_prediccio = self.create_sequences_for_prediction(data_procesada)
+
+        n_features = x_prediccio.shape[2]
+
+        y_pred = self.predict(self.best_model, x_prediccio)
 
 
         # Organizar y guardar la predicción en un archivo
@@ -290,28 +294,30 @@ if __name__ == '__main__':
         rnn.split_data(data_procesada)
 
         print("Optimizando hiperparámetros...")
-        best_params = rnn.optimize(n_trials=50)
+        best_params = rnn.optimize(n_trials=2)
         print(f"Mejores hiperparámetros encontrados: {best_params}")
         print(best_params)
 
         final_model = rnn.best_model
+        print("Guardando el modelo...")
+        final_model.save(rnn.fitxerModel)
+        print(f"Modelo guardado en {rnn.fitxerModel}")
 
         if guardar_model:
-            print("Guardando el modelo...")
-            final_model.save(rnn.fitxerModel)
-            print(f"Modelo guardado en {rnn.fitxerModel}")
-            # mySql = MysqlModel()
-            # mySql.guardar(final_model)
+            mySql = MysqlModel()
+            mySql.guardar(final_model)
+            # Leer los datos
+            data = rnn.read_data(nomFitxer=".\\dades\\Dades_Per_entrenar.csv")
+            # Crear una instancia de la clase MysqlModel
+            mysql_model = MysqlModel()
+            # Obtener los datos del fichero de predicción
+            fitxerModel = mysql_model.recuperar()
+            print("Modelo guardado y recuperado de mysql")
+        else:
+            print("No se ha guardado el modelo en mysql")
 
     if prediccio:
-        # Leer los datos
-        print("Leyendo los datos...")
-        data = rnn.read_data(nomFitxer=".\\dades\\Dades_Per_entrenar.csv")
-        # Crear una instancia de la clase MysqlModel
-        # mysql_model = MysqlModel()
-        # Obtener los datos del fichero de predicción
-        # fitxerModel = mysql_model.recuperar()
-        rnn.best_model = load_model(rnn.fitxerModel)
+
+        rnn.best_model = load_model(fitxerModel)
         # Ejecutar la predicción
-        print("Ejecutando la predicción...")
         rnn.predict_last_rows()
