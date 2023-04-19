@@ -4,6 +4,11 @@ import numpy as np
 import optuna
 import pandas as pd
 import tensorflow as tf
+import os
+import datetime
+import shutil
+from tensorflow.keras.models import save_model
+import pickle
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.layers import LSTM, Dense, Reshape
 from tensorflow.keras.models import Sequential, load_model
@@ -13,6 +18,11 @@ import tensorflow.keras.backend as K
 from optuna.pruners import MedianPruner
 from tensorflow.keras.layers import Bidirectional
 from keras.callbacks import EarlyStopping
+from tensorflow.keras.layers import Dropout
+import os
+import pandas as pd
+import pickle
+import h5py
 
 
 from sklearn.metrics import accuracy_score, mean_squared_error, mean_absolute_error, r2_score
@@ -63,7 +73,7 @@ class RNNModel:
         data = pd.read_csv(adressFile, sep=";", parse_dates=[0])
         return data
 
-    def preprocess_data(self, data_prediccion=None):
+    def preprocess_data_sin_categoria(self, data_prediccion=None):
         if data_prediccion is None:
             data_procesada = self.data.copy()
         else:
@@ -77,7 +87,7 @@ class RNNModel:
 
         return data_procesada
 
-    def preprocess_data_categoria(self, data_prediccion=None):
+    def preprocess_data(self, data_prediccion=None):
         if data_prediccion is None:
             data_procesada = self.data.copy()
         else:
@@ -122,7 +132,7 @@ class RNNModel:
 
         return np.array([input_data])
 
-    def create_sequences(self, data):
+    def create_sequences_sin_categoria(self, data):
         """
                Crea secuencias de datos de entrada y salida a partir del conjunto de datos procesado.
         """
@@ -141,7 +151,7 @@ class RNNModel:
 
         return np.array(X), np.array(y)
 
-    def create_sequences_categoria(self, data):
+    def create_sequences(self, data):
         """
                Crea secuencias de datos de entrada y salida a partir del conjunto de datos procesado.
         """
@@ -168,11 +178,13 @@ class RNNModel:
         model = Sequential()
         model.add(
             Bidirectional(LSTM(num_units_layer, input_shape=(self.input_steps, n_features), return_sequences=True)))
+        model.add(Dropout(0.2))
 
         for i in range(n_layers - 1):
             model.add(Bidirectional(LSTM(num_units_layer, return_sequences=True)))
+            model.add(Dropout(0.2))
         model.add(Bidirectional(LSTM(num_units_layer, return_sequences=False)))
-        model.add(Dense(self.output_steps * self.y_train.shape[2], activation=None))
+        model.add(Dense(self.output_steps * self.y_train.shape[2], activation='relu'))
         model.add(Reshape((self.output_steps, self.y_train.shape[2])))
 
         # Compilar el modelo con el optimizador Adam y la función de pérdida mean_absolute_error
@@ -200,7 +212,7 @@ class RNNModel:
         model = self.create_model(n_layers, num_units_layer, lr)
 
         early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
-        history = model.fit(self.x_train, self.y_train, epochs=n_epochs, batch_size=batch_size, verbose=1,
+        history = model.fit(self.x_train, self.y_train, epochs=n_epochs, batch_size=batch_size, verbose=0,
                             validation_data=(self.x_test, self.y_test), callbacks=[early_stopping])
 
         # Evaluar el modelo en el conjunto de prueba
@@ -235,17 +247,52 @@ class RNNModel:
 
         return tf.reduce_mean(weighted_absolute_errors)
 
-    def optimize(self, n_trials=50):
+    def optimize(self, n_trials=50, study=None, initial_params=None):
         """
         Optimiza los hiperparámetros del modelo LSTM utilizando Optuna.
         """
         pruner = MedianPruner()
-        study = optuna.create_study(direction='minimize', pruner=pruner)
+
+        if study is None:
+            study = optuna.create_study(direction='minimize', pruner=pruner)
+
+        if initial_params is not None:
+            # Utilizar los valores iniciales como sugerencias en el espacio de búsqueda de Optuna
+            study.enqueue_trial(initial_params)
+
         study.optimize(self.objective, n_trials=n_trials)
 
         self.best_params = study.best_params
 
-        return study.best_params
+        return study.best_params, study
+
+    def train_best_model(self, best_params):
+        """
+        Entrena el modelo con los mejores hiperparámetros encontrados y devuelve el modelo entrenado.
+        """
+        n_layers = best_params["n_layers"]
+        num_units_layer = best_params["num_units_layer"]
+        lr = best_params["lr"]
+        n_epochs = 10000
+        batch_size = best_params["batch_size"]
+
+        self.best_model = self.create_model(n_layers, num_units_layer, lr)
+
+        print("Hiperparámetros del modelo entrenado:")
+        for layer in self.best_model.layers:
+            print(layer.get_config())
+
+        early_stopping = EarlyStopping(monitor='val_loss', patience=100, restore_best_weights=True)
+        history = self.best_model.fit(self.x_train, self.y_train, epochs=n_epochs, batch_size=batch_size, verbose=1,
+                            validation_data=(self.x_test, self.y_test))
+        print(history)
+        # Evaluar el modelo en el conjunto de prueba
+        y_pred = self.best_model.predict(self.x_test)
+        # Calcular el error absoluto medio ponderado
+        weighted_mae = self.weighted_mean_absolute_error(self.y_test, y_pred)
+        print(weighted_mae)
+
+        return self.best_model
 
     def predict(self, model, input_sequence):
         # Realizar la predicción utilizando el modelo entrenado
@@ -300,43 +347,153 @@ class RNNModel:
         output_df.to_excel(output_file, index=False)
         print(f"Predicción guardada en el archivo: {output_file}")
 
+    def guardar_model(self, model_save, study, csv_path):
+        # Obtenir la data i hora actual amb el format especificat
+        data_hora = datetime.datetime.now().strftime('%d%m%Y__%H_%M')
+
+        # # nameModel = study.best_params["nameModel"]
+        # # Crear la ruta de la carpeta on es guardaran els resultats
+        # carpetaModel = os.path.join(os.path.join(".\\model",  csv_path))
+        # os.makedirs(carpetaModel, exist_ok=True)
+
+        # Crear la subcarpeta amb el nom de la data i hora
+        subcarpeta = os.path.join(os.path.join(".\\saved_models", data_hora))
+        os.makedirs(subcarpeta, exist_ok=True)
+
+        # Guardar el model en un fitxer .h5
+        model_path = os.path.join(subcarpeta, "model.h5")
+        save_model(model_save, model_path)
+
+        # Extreure els hiperparàmetres del model
+        hiperparametres = model_save.get_config()
+
+        # Guardar els hiperparàmetres en un fitxer .pkl
+        hiperparametres_path = os.path.join(subcarpeta, "hiperparametres.pkl")
+
+        # Guardar el fitxer CSV amb els resultats de l'estudi
+        study_path = os.path.join(subcarpeta, "study.csv")
+        study.trials_dataframe().to_csv(study_path)
+        print(study.best_value)
+        print(study.best_params)
+        print(study.best_trial)
+
+        with open(hiperparametres_path, 'wb') as f:
+            pickle.dump(hiperparametres, f)
+
+        # Copiar el fitxer CSV a la subcarpeta
+        shutil.copy2(csv_path, subcarpeta)
+
+    def search_and_train_with_optuna(self, n_searches, n_trials_per_search, model_save_path):
+        """
+        Realiza la búsqueda de los mejores modelos utilizando Optuna y entrena el mejor modelo.
+        Guarda el modelo y repite el proceso n_searches veces.
+
+        :param n_searches: Número de veces para repetir el proceso de búsqueda y entrenamiento.
+        :param n_trials_per_search: Número de trials por búsqueda en Optuna.
+        :param model_save_path: Ruta donde se guardarán los modelos entrenados.
+        """
+        study = None  # Inicializar el objeto de estudio como None
+        best_params = None  # Inicializar los mejores parámetros como None
+        for i in range(n_searches):
+            print(f"\nBúsqueda y entrenamiento {i + 1} de {n_searches}")
+
+            # Optimizar hiperparámetros con Optuna
+            print("Optimizando hiperparámetros...")
+            best_params, study = self.optimize(
+                n_trials=n_trials_per_search, study=study, initial_params=best_params
+            )
+            print(f"Mejores hiperparámetros encontrados: {best_params}")
+
+            # Guardar el mejor modelo
+            save_path = os.path.join(model_save_path, f"best_model_{i + 1}.h5")
+            self.guardar_model(self.best_model, study, self.input_file)
+            print(f"Modelo guardado en {save_path}")
+
 
 if __name__ == '__main__':
-    usar_optuna = True
-    prediccio = True
-    guardar_model = True
-    input_file = ".\\dades\\Dades_Per_entrenarN.csv"  # Reemplazar por la ruta del archivo CSV
-    rnn = RNNModel(input_file)
-    data = rnn.read_data()
-    if usar_optuna:
+
+    prediccio_carpeta = False
+    optuna_for = True
+    usar_optuna = False
+    prediccio = False
+    guardar_model = False
+    model_entrenat = None
+    entrenar = False
+
+    # Prediccions amb un model ja entrenat
+    if prediccio_carpeta:
+        directorio = r"C:\Users\u1050\PycharmProjects\RNN_LLE\for_model\Cat1_17042023\model\18042023__10_18"
+        # directorio = r"C:\Users\u1050\PycharmProjects\RNN_LLE\for_model\Cat2_17042023\model\18042023__08_34"
+        # directorio = r"C:\Users\u1050\PycharmProjects\RNN_LLE\for_model\Cat3_17042023\model\18042023__18_56"
+        # directorio = r"C:\Users\u1050\PycharmProjects\RNN_LLE\for_model\Cat4_17042023\model\18042023__09_19"
+        # directorio = r"C:\Users\u1050\PycharmProjects\RNN_LLE\for_model\Cat5_17042023\model\17042023__19_59"
+        datos = None
+        modelo = None
+        hiperparametros = None
+
+        for archivo in os.listdir(directorio):
+            if archivo.endswith('.csv') and datos is None:
+                fitxer = (os.path.join(directorio, archivo))
+            elif archivo.endswith('.pkl') and hiperparametros is None:
+                with open(os.path.join(directorio, archivo), 'rb') as f:
+                    hiperparametros = pickle.load(f)
+            elif archivo.endswith('.h5') and modelo is None:
+                modelo = h5py.File(os.path.join(directorio, archivo), 'r')
+
+        rnnFolder = RNNModel(fitxer)
+        rnnFolder.best_model = load_model(modelo)
+        rnnFolder.best_model.set_weights(hiperparametros)
+        # Leer los datos
+        data = rnnFolder.read_data()
+        data_procesada = rnnFolder.preprocess_data()
+        rnnFolder.split_data(data_procesada)
+        # Ejecutar la predicción
+        rnnFolder.predict_last_rows()
+
+    else:
+        input_file = r".\dades\Dades_Per_entrenar.csv"  # Reemplazar por la ruta del archivo CSV
+        rnn = RNNModel(input_file)
+        data = rnn.read_data()
+
         data_procesada = rnn.preprocess_data()
         rnn.split_data(data_procesada)
+        if usar_optuna:
+            print("Optimizando hiperparámetros...")
+            best_params = rnn.optimize(n_trials=1)
+            print(f"Mejores hiperparámetros encontrados: {best_params}")
+            print(best_params)
 
-        print("Optimizando hiperparámetros...")
-        best_params = rnn.optimize(n_trials=500)
-        print(f"Mejores hiperparámetros encontrados: {best_params}")
-        print(best_params)
+            final_model = rnn.best_model
+            print("Guardando el modelo...")
+            final_model.save(rnn.fitxerModel)
+            print(f"Modelo guardado en {rnn.fitxerModel}")
 
-        final_model = rnn.best_model
-        print("Guardando el modelo...")
-        final_model.save(rnn.fitxerModel)
-        print(f"Modelo guardado en {rnn.fitxerModel}")
+            if guardar_model:
+                mySql = MysqlModel()
+                mySql.guardar(final_model)
+                # Leer los datos
+                data = rnn.read_data(nomFitxer=".\\dades\\Dades_Per_entrenarN_P.csv")
+                # Crear una instancia de la clase MysqlModel
+                mysql_model = MysqlModel()
+                # Obtener los datos del fichero de predicción
+                fitxerModel = mysql_model.recuperar()
+                print("Modelo guardado y recuperado de mysql")
+            else:
+                print("No se ha guardado el modelo en mysql")
 
-        if guardar_model:
-            mySql = MysqlModel()
-            mySql.guardar(final_model)
-            # Leer los datos
-            data = rnn.read_data(nomFitxer=".\\dades\\Dades_Per_entrenarN.csv")
-            # Crear una instancia de la clase MysqlModel
-            mysql_model = MysqlModel()
-            # Obtener los datos del fichero de predicción
-            fitxerModel = mysql_model.recuperar()
-            print("Modelo guardado y recuperado de mysql")
-        else:
-            print("No se ha guardado el modelo en mysql")
+        if optuna_for:
+            n_searches = 1
+            n_trials_per_search = 1
+            model_save_path = ".\\saved_models"
 
-    if prediccio:
+            rnn.search_and_train_with_optuna(n_searches, n_trials_per_search, model_save_path)
 
-        rnn.best_model = load_model(rnn.fitxerModel)
-        # Ejecutar la predicción
-        rnn.predict_last_rows()
+        if prediccio:
+            rnn.fitxerModel = ".\\saved_models\\best_model_1.h5"
+            if model_entrenat:
+                rnn.best_model = model_entrenat
+            else:
+                # Cargar el modelo
+                rnn.best_model = load_model(rnn.fitxerModel)
+            # Ejecutar la predicción
+            rnn.predict_last_rows()
