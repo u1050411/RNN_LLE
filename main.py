@@ -540,7 +540,7 @@ if __name__ == '__main__':
         rnnFolder.predict_last_rows()
 
     else:
-        input_file = r".\dades\Dades_Per_entrenar.csv"  # Reemplazar por la ruta del archivo CSV
+        input_file = r"./RNN_LLE/dades/Dades_Per_entrenar.csv"  # Reemplazar por la ruta del archivo CSV
         rnn = RNNModel(input_file)
         data = rnn.read_data()
 
