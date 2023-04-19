@@ -1,31 +1,24 @@
 import datetime
+import os
+import pickle
+import shutil
 
+import h5py
 import numpy as np
 import optuna
 import pandas as pd
 import tensorflow as tf
-import os
-import datetime
-import shutil
-from tensorflow.keras.models import save_model
-import pickle
+from keras.callbacks import EarlyStopping
+from optuna.pruners import MedianPruner
 from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.layers import Bidirectional
+from tensorflow.keras.layers import Dropout
 from tensorflow.keras.layers import LSTM, Dense, Reshape
 from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.models import save_model
 from tensorflow.keras.optimizers import Adam
+
 from MysqlModel import MysqlModel
-import tensorflow.keras.backend as K
-from optuna.pruners import MedianPruner
-from tensorflow.keras.layers import Bidirectional
-from keras.callbacks import EarlyStopping
-from tensorflow.keras.layers import Dropout
-import os
-import pandas as pd
-import pickle
-import h5py
-
-
-from sklearn.metrics import accuracy_score, mean_squared_error, mean_absolute_error, r2_score
 
 SEMILLA = 42
 
@@ -54,10 +47,10 @@ class RNNModel:
         self.output_column_names = None
         self.fitxerModel = '.\\model\\model.h5'
         self.hyperparameter_ranges = {
-            "n_layers": [1, 3],
+            "n_layers": [1, 30],
             "num_units_layer": [16, 200],
             "lr": [1e-4, 1e-2],
-            "n_epochs": [50, 100],
+            "n_epochs": [100, 300],
             "batch_size": [16, 64]
         }
 
@@ -123,12 +116,13 @@ class RNNModel:
         """
         Crea secuencias de datos de entrada a partir del conjunto de datos procesado para realizar predicciones.
         """
-        # Asegurarse de que los datos contienen al menos los últimos 'input_steps'
-        if len(data) < self.input_steps:
-            raise ValueError(f"Se requieren al menos {self.input_steps} registros en los datos para la predicción.")
+        # Asegurarse de que los datos contienen al menos los últimos 'input_steps_categoria'
+        if len(data) < self.input_steps_categoria:
+            raise ValueError(
+                f"Se requieren al menos {self.input_steps_categoria} registros en los datos para la predicción.")
 
-        # Tomar solo los últimos 'input_steps' datos
-        input_data = data.iloc[-self.input_steps:, [0, *range(4, data.shape[1])]].values
+        # Tomar solo los últimos 'input_steps_categoria' datos
+        input_data = data.iloc[-self.input_steps_categoria:, [0, *range(4, data.shape[1])]].values
 
         return np.array([input_data])
 
@@ -158,11 +152,13 @@ class RNNModel:
         X, y = [], []
 
         # Recorrer el conjunto de datos y crear secuencias de entrada y salida
-        for i in range(len(data) - self.input_steps - self.output_steps + 1):
+        for i in range(len(data) - self.input_steps_categoria - self.output_steps_categoria + 1):
             # Seleccionar las columnas de entrada (todas menos las tres numéricas que se quieren predecir)
-            input_data = data.iloc[i:i + self.input_steps, [0, *range(4, data.shape[1])]].values
+            input_data = data.iloc[i:i + self.input_steps_categoria, [0, *range(4, data.shape[1])]].values
             # Seleccionar las columnas de salida (numéricas)
-            output_data = data.iloc[i + self.input_steps:i + self.input_steps + self.output_steps, 0:3].values
+            output_data = data.iloc[
+                          i + self.input_steps_categoria:i + self.input_steps_categoria + self.output_steps_categoria,
+                          0:3].values
             self.output_column_names = data.columns[3:6].tolist()
 
             X.append(input_data)
@@ -171,6 +167,30 @@ class RNNModel:
         return np.array(X), np.array(y)
 
     def create_model(self, n_layers, num_units_layer, lr):
+        """
+        Crea un modelo LSTM con los hiperparámetros proporcionados.
+        """
+        n_features = self.x_train.shape[2]
+        model = Sequential()
+        model.add(
+            Bidirectional(
+                LSTM(num_units_layer, input_shape=(self.input_steps_categoria, n_features), return_sequences=True)))
+        model.add(Dropout(0.2))
+
+        for i in range(n_layers - 1):
+            model.add(Bidirectional(LSTM(num_units_layer, return_sequences=True)))
+            model.add(Dropout(0.2))
+        model.add(Bidirectional(LSTM(num_units_layer, return_sequences=False)))
+        model.add(Dense(self.output_steps_categoria * self.y_train.shape[2], activation='relu'))
+        model.add(Reshape((self.output_steps_categoria, self.y_train.shape[2])))
+
+        # Compilar el modelo con el optimizador Adam y la función de pérdida mean_absolute_error
+        model.compile(optimizer=Adam(learning_rate=lr), loss=tf.keras.losses.MeanAbsoluteError())
+
+        # Devuelve solo el modelo
+        return model
+
+    def create_model_sin_Categoria(self, n_layers, num_units_layer, lr):
         """
         Crea un modelo LSTM con los hiperparámetros proporcionados.
         """
@@ -241,6 +261,22 @@ class RNNModel:
         y_true = tf.cast(y_true, tf.float64)  # Convertir y_true a float64
         absolute_errors = tf.math.abs(y_true - y_pred)
 
+        weights = self.get_error_weights(self.output_steps_categoria)
+        weights = tf.reshape(weights, (-1, 1))  # Asegurar que weights tenga la forma (-1, 1)
+        weighted_absolute_errors = absolute_errors * weights
+
+        return tf.reduce_mean(weighted_absolute_errors)
+
+    @tf.function
+    def weighted_mean_absolute_error_Sin_Categoria(self, y_true, y_pred):
+        """
+        Calcula el error absoluto medio ponderado, dando más peso a los errores
+        en las primeras etapas de la secuencia de salida.
+        """
+        y_pred = tf.cast(y_pred, tf.float64)  # Convertir y_pred a float64
+        y_true = tf.cast(y_true, tf.float64)  # Convertir y_true a float64
+        absolute_errors = tf.math.abs(y_true - y_pred)
+
         weights = self.get_error_weights(self.output_steps)
         weights = tf.reshape(weights, (-1, 1))  # Asegurar que weights tenga la forma (-1, 1)
         weighted_absolute_errors = absolute_errors * weights
@@ -284,7 +320,7 @@ class RNNModel:
 
         early_stopping = EarlyStopping(monitor='val_loss', patience=100, restore_best_weights=True)
         history = self.best_model.fit(self.x_train, self.y_train, epochs=n_epochs, batch_size=batch_size, verbose=1,
-                            validation_data=(self.x_test, self.y_test))
+                                      validation_data=(self.x_test, self.y_test))
         print(history)
         # Evaluar el modelo en el conjunto de prueba
         y_pred = self.best_model.predict(self.x_test)
@@ -295,6 +331,30 @@ class RNNModel:
         return self.best_model
 
     def predict(self, model, input_sequence):
+        # Realizar la predicción utilizando el modelo entrenado
+        y_pred = model.predict(input_sequence)
+
+        n_points = y_pred.shape[1] * y_pred.shape[2]
+        y_pred_flat = y_pred.reshape((y_pred.shape[0], n_points))
+
+        # Asegúrate de que el objeto scaler_output tenga la forma correcta
+        if self.scaler_output.n_features_in_ != n_points:
+            self.scaler_output.n_features_in_ = n_points
+            self.scaler_output.min_ = np.tile(self.scaler_output.min_, self.output_steps_categoria)
+            self.scaler_output.scale_ = np.tile(self.scaler_output.scale_, self.output_steps_categoria)
+
+        y_pred_inv = self.scaler_output.inverse_transform(y_pred_flat)
+
+        # Reorganizar las columnas de y_pred_inv de acuerdo a las características originales
+        y_pred_inv_rearranged = []
+        for i in range(0, y_pred_inv.shape[1], self.output_steps_categoria):
+            y_pred_inv_rearranged.append(y_pred_inv[:, i:i + self.output_steps_categoria])
+
+        y_pred_inv = np.hstack(y_pred_inv_rearranged)
+
+        return y_pred_inv
+
+    def predict_sin_Categoria(self, model, input_sequence):
         # Realizar la predicción utilizando el modelo entrenado
         y_pred = model.predict(input_sequence)
 
@@ -325,7 +385,7 @@ class RNNModel:
         data_copiada = self.data.copy()
         data_copiada = data_copiada.dropna()
 
-        data_limitat = data_copiada.tail(self.input_steps)
+        data_limitat = data_copiada.tail(self.input_steps_categoria)
 
         data_procesada = self.preprocess_data(data_prediccion=data_limitat)
 
@@ -334,7 +394,6 @@ class RNNModel:
         n_features = x_prediccio.shape[2]
 
         y_pred = self.predict(self.best_model, x_prediccio)
-
 
         # Organizar y guardar la predicción en un archivo
         column_names = ['Index'] + [f'Column_{i}' for i in range(1, 4)]
@@ -346,6 +405,35 @@ class RNNModel:
         output_file = f".\\predicciones\\primer_semestre{current_time}.xlsx"
         output_df.to_excel(output_file, index=False)
         print(f"Predicción guardada en el archivo: {output_file}")
+
+    def predict_last_rows_sin_Categoria(self):
+        """Ejecutar la predicción del mejor modelo con un fichero y seleccionar las últimas filas."""
+
+        # Cargar los datos del fichero
+        data_copiada = self.data.copy()
+        data_copiada = data_copiada.dropna()
+
+        data_limitat = data_copiada.tail(self.input_steps_categoria)
+
+        data_procesada = self.preprocess_data(data_prediccion=data_limitat)
+
+        x_prediccio = self.create_sequences_for_prediction(data_procesada)
+
+        n_features = x_prediccio.shape[2]
+
+        y_pred = self.predict(self.best_model, x_prediccio)
+
+        # Organizar y guardar la predicción en un archivo
+        column_names = ['Index'] + [f'Column_{i}' for i in range(1, 4)]
+        repeated_numbers = np.tile(np.arange(1, 6), len(y_pred[0]) // (3 * 5) + 1)[:len(y_pred[0]) // 3]
+        y_pred_reshaped = np.column_stack((repeated_numbers, y_pred[0][::3], y_pred[0][1::3], y_pred[0][2::3]))
+        output_df = pd.DataFrame(y_pred_reshaped, columns=column_names)
+
+        current_time = datetime.datetime.now().strftime("%d-%m-%Y_%H-%M")
+        output_file = f".\\predicciones\\primer_semestre{current_time}.xlsx"
+        output_df.to_excel(output_file, index=False)
+        print(f"Predicción guardada en el archivo: {output_file}")
+
 
     def guardar_model(self, model_save, study, csv_path):
         # Obtenir la data i hora actual amb el format especificat
@@ -382,6 +470,7 @@ class RNNModel:
 
         # Copiar el fitxer CSV a la subcarpeta
         shutil.copy2(csv_path, subcarpeta)
+
 
     def search_and_train_with_optuna(self, n_searches, n_trials_per_search, model_save_path):
         """
@@ -482,8 +571,8 @@ if __name__ == '__main__':
                 print("No se ha guardado el modelo en mysql")
 
         if optuna_for:
-            n_searches = 1
-            n_trials_per_search = 1
+            n_searches = 1000
+            n_trials_per_search = 1000
             model_save_path = ".\\saved_models"
 
             rnn.search_and_train_with_optuna(n_searches, n_trials_per_search, model_save_path)
