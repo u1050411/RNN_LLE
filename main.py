@@ -402,7 +402,7 @@ class RNNModel:
         output_df = pd.DataFrame(y_pred_reshaped, columns=column_names)
 
         current_time = datetime.datetime.now().strftime("%d-%m-%Y_%H-%M")
-        output_file = f".\\predicciones\\primer_semestre{current_time}.xlsx"
+        output_file = f"./predicciones/primer_semestre{current_time}.xlsx"
         output_df.to_excel(output_file, index=False)
         print(f"Predicción guardada en el archivo: {output_file}")
 
@@ -430,7 +430,7 @@ class RNNModel:
         output_df = pd.DataFrame(y_pred_reshaped, columns=column_names)
 
         current_time = datetime.datetime.now().strftime("%d-%m-%Y_%H-%M")
-        output_file = f".\\predicciones\\primer_semestre{current_time}.xlsx"
+        output_file = f"./predicciones/primer_semestre{current_time}.xlsx"
         output_df.to_excel(output_file, index=False)
         print(f"Predicción guardada en el archivo: {output_file}")
 
@@ -445,7 +445,7 @@ class RNNModel:
         # os.makedirs(carpetaModel, exist_ok=True)
 
         # Crear la subcarpeta amb el nom de la data i hora
-        subcarpeta = os.path.join(os.path.join(".\\saved_models", data_hora))
+        subcarpeta = os.path.join(os.path.join("./saved_models", data_hora))
         os.makedirs(subcarpeta, exist_ok=True)
 
         # Guardar el model en un fitxer .h5
@@ -573,12 +573,12 @@ if __name__ == '__main__':
         if optuna_for:
             n_searches = 1000
             n_trials_per_search = 1000
-            model_save_path = ".\\saved_models"
+            model_save_path = "./saved_models"
 
             rnn.search_and_train_with_optuna(n_searches, n_trials_per_search, model_save_path)
 
         if prediccio:
-            rnn.fitxerModel = ".\\saved_models\\best_model_1.h5"
+            rnn.fitxerModel = "./saved_models/best_model_1.h5"
             if model_entrenat:
                 rnn.best_model = model_entrenat
             else:
